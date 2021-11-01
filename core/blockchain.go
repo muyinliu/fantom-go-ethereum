@@ -18,14 +18,20 @@
 package core
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	mrand "math/rand"
+	"os"
+	"os/signal"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -36,6 +42,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/downstream"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -45,6 +52,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	lru "github.com/hashicorp/golang-lru"
+	"github.com/streadway/amqp"
 )
 
 var (
@@ -209,12 +217,18 @@ type BlockChain struct {
 
 	shouldPreserve  func(*types.Block) bool        // Function used to determine whether should preserve the given block.
 	terminateInsert func(common.Hash, uint64) bool // Testing hook used to terminate ancient receipt chain insertion.
+
+	downstreamConfig  *DownstreamConfig
+	downstreamConn    *amqp.Connection
+	downstreamChan    *amqp.Channel
+	downstreamConfirm chan amqp.Confirmation
+	downstreamSeq     int
 }
 
 // NewBlockChain returns a fully initialised block chain using information
 // available in the database. It initialises the default Ethereum Validator and
 // Processor.
-func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64) (*BlockChain, error) {
+func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *params.ChainConfig, downstreamConfig *DownstreamConfig, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(block *types.Block) bool, txLookupLimit *uint64) (*BlockChain, error) {
 	if cacheConfig == nil {
 		cacheConfig = defaultCacheConfig
 	}
@@ -245,6 +259,10 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, chainConfig *par
 		futureBlocks:   futureBlocks,
 		engine:         engine,
 		vmConfig:       vmConfig,
+		downstreamConfig: downstreamConfig,
+	}
+	if bc.downstreamConfig != nil && bc.downstreamConfig.TimeoutInterval == 0 {
+		bc.downstreamConfig.TimeoutInterval = 5000
 	}
 	bc.validator = NewBlockValidator(chainConfig, bc, engine)
 	bc.prefetcher = newStatePrefetcher(chainConfig, bc, engine)
@@ -770,6 +788,8 @@ func (bc *BlockChain) ExportN(w io.Writer, first uint64, last uint64) error {
 //
 // Note, this function assumes that the `mu` mutex is held!
 func (bc *BlockChain) writeHeadBlock(block *types.Block) {
+	bc.sendBlockToDownstream(block)
+
 	// If the block is on a side chain or an unknown one, force other heads onto it too
 	updateHeads := rawdb.ReadCanonicalHash(bc.db, block.NumberU64()) != block.Hash()
 
@@ -796,6 +816,202 @@ func (bc *BlockChain) writeHeadBlock(block *types.Block) {
 	}
 	bc.currentBlock.Store(block)
 	headBlockGauge.Update(int64(block.NumberU64()))
+}
+
+func (bc *BlockChain) setupDownstreamConn(block *types.Block) {
+	var err error
+
+	for {
+		if bc.downstreamConn != nil && !bc.downstreamConn.IsClosed() {
+			log.Info("Try close connection")
+			// make sure existing connection closed
+			bc.downstreamConn.Close()
+			log.Warn("Close connection to downstream")
+		}
+
+		bc.downstreamConn, err = amqp.Dial(bc.downstreamConfig.URIs[bc.downstreamSeq%len(bc.downstreamConfig.URIs)])
+		bc.downstreamSeq += 1
+		if err != nil {
+			log.Error("Connect downstream error", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "err", err)
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			continue
+		}
+
+		bc.downstreamChan, err = bc.downstreamConn.Channel()
+		if err != nil {
+			log.Error("Create downstreeam channel error", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "err", err)
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			continue
+		}
+
+		if err = bc.downstreamChan.Confirm(false); err != nil {
+			log.Error("Set confirm error", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "err", err)
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			continue
+		}
+
+		bc.downstreamConfirm = bc.downstreamChan.NotifyPublish(make(chan amqp.Confirmation, 1))
+		break
+	}
+}
+
+func (bc *BlockChain) sendBlockToDownstream(block *types.Block) {
+	if bc.downstreamConfig == nil {
+		return
+	}
+
+	if bc.downstreamConn == nil || bc.downstreamConn.IsClosed() {
+		bc.setupDownstreamConn(block)
+	}
+
+	receipts := rawdb.ReadReceipts(bc.db, block.Hash(), block.NumberU64(), bc.chainConfig)
+
+	if block.Transactions().Len() != receipts.Len() {
+		log.Error("Txs count and receipts count not equal", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "tx count", block.Transactions().Len(), "receipt count", receipts.Len())
+		return
+	}
+
+	dBlock := downstream.FromOrgBlock(block)
+	dTxs := make([]*downstream.TxWithReceipt, 0, block.Transactions().Len())
+	dLogs := make([]*downstream.EventLog, 0)
+
+	signer := types.MakeSigner(bc.chainConfig, block.Number())
+	for i, oTx := range block.Transactions() {
+		tx, err := downstream.FromOrgTx(oTx, block, signer)
+		if err != nil {
+			log.Error("convert tx error", "err", err)
+			return
+		}
+
+		tx.Index = i
+		dBlock.Transactions = append(dBlock.Transactions, tx)
+
+		receipt2 := downstream.FromOrgReceipt(receipts[i], oTx.Hash().Hex(), tx.Index, block)
+		txr, err := downstream.FromOrgTxWithReceipt(oTx, block, receipt2, signer)
+		if err != nil {
+			log.Error("convert tx with receipt error", "err", err)
+			return
+		}
+
+		dTxs = append(dTxs, txr)
+
+		for _, eventLog := range receipt2.Logs {
+			eventLog.Class = "com.mingsi.data.connector.entity.EventLog"
+			dLogs = append(dLogs, eventLog)
+		}
+	}
+
+	dBlock.TransactionCount = len(dBlock.Transactions)
+
+	totalOut := &downstream.Total{
+		Version: "1",
+		Block:   dBlock,
+		Txs:     dTxs,
+		Logs:    dLogs,
+	}
+
+	var content_encoding = ""
+	var message_data []byte
+	var data []byte
+	var err error
+	for {
+		data, err = json.Marshal(totalOut)
+		if err != nil {
+			log.Error("Marshal data error", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "err", err)
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			continue
+		}
+		break
+	}
+
+	if bc.downstreamConfig.Compress == true {
+		// compress data with gzip
+		start := time.Now()
+		var buffer bytes.Buffer
+		gz := gzip.NewWriter(&buffer)
+		if _, err := gz.Write(data); err != nil {
+			log.Error("Compress data error", "err", err)
+		}
+		if err := gz.Close(); err != nil {
+			log.Error("Compress data error", "err", err)
+		}
+		message_data = buffer.Bytes()
+		elapsed := time.Since(start)
+		log.Debug("Compress message", "from", len(data), "to", len(message_data), "takes(ms)", elapsed.Milliseconds())
+		content_encoding = "gzip"
+	} else {
+		message_data = data
+	}
+
+	var timeoutTimer *time.Timer
+	timeoutDuration := time.Millisecond * time.Duration(bc.downstreamConfig.TimeoutInterval)
+
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+
+	var prevErrorMessage = ""
+
+	for {
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+
+		for len(bc.downstreamConfirm) > 0 {
+			<-bc.downstreamConfirm
+		}
+
+		timeoutTimer = time.NewTimer(timeoutDuration)
+
+		err = bc.downstreamChan.Publish(
+			bc.downstreamConfig.Exchange,
+			bc.downstreamConfig.RoutingKey,
+			true,
+			false,
+			amqp.Publishing{
+				Headers:         amqp.Table{},
+				ContentType:     "application/json",
+				ContentEncoding: content_encoding,
+				Body:            message_data,
+				DeliveryMode:    amqp.Persistent,
+				Timestamp:       time.Now(),
+				Priority:        0,
+			},
+		)
+
+		if err != nil {
+			log.Error("Send data to downstream error", "block hash", block.Hash().Hex(), "block number", block.NumberU64(), "err", err)
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			bc.setupDownstreamConn(block)
+			prevErrorMessage = err.Error()
+			continue
+		} else if prevErrorMessage != "" {
+			log.Info("Send data to downstream recover", "prevErrorMessage", prevErrorMessage)
+			prevErrorMessage = ""
+		}
+
+		select {
+		case confirm := <-bc.downstreamConfirm:
+			if !confirm.Ack {
+				log.Error("Send data without ack confirm", "block hash", block.Hash().Hex(), "block number", block.NumberU64())
+				prevErrorMessage = "Send data without ack confirm"
+				continue
+			}
+		case <-timeoutTimer.C:
+			log.Error("Send data timeout", "block hash", block.Hash().Hex(), "block number", block.NumberU64())
+			prevErrorMessage = "Send data timeout"
+			time.Sleep(time.Millisecond * time.Duration(bc.downstreamConfig.RetryInterval))
+			bc.setupDownstreamConn(block)
+			continue
+		case <-sigc:
+			break
+		}
+
+		log.Debug("Send data to downstream", "block hash", block.Hash().Hex(), "block number", block.NumberU64())
+
+		break
+	}
+
+	timeoutTimer.Stop()
 }
 
 // Genesis retrieves the chain's genesis block.
